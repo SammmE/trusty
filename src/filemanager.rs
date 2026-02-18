@@ -266,12 +266,15 @@ pub async fn upload_file(
         .await
         .map_err(|_| FileError::StorageError)?;
 
+    // Calculate actual file size from uploaded data to prevent size spoofing
+    let actual_size = form.file.contents.len() as i64;
+
     let file = File {
         id: file_id.clone(),
         user_id: claims.user_id.clone(),
         original_name: metadata.original_name,
         mime_type: metadata.mime_type,
-        size_bytes: metadata.size_bytes,
+        size_bytes: actual_size, // Use actual size, not user-provided metadata
         is_encrypted: true,
         storage_path,
         created_at: chrono::Utc::now().to_rfc3339(),

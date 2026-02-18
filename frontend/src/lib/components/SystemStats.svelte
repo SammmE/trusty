@@ -120,7 +120,7 @@
 			<DialogDescription>
 				Real-time system performance and usage metrics
 				{#if stats}
-					(updating at {stats.update_rate_hz}Hz)
+					(updating at {stats.update_rate_hz}Hz) - Your files only
 				{/if}
 			</DialogDescription>
 		</DialogHeader>
@@ -192,11 +192,11 @@
 				<!-- File Storage Stats -->
 				<div class="grid grid-cols-2 gap-4">
 					<div class="rounded-lg border bg-card p-4">
-						<div class="text-sm font-medium text-muted-foreground">Total Files</div>
+						<div class="text-sm font-medium text-muted-foreground">Your Files</div>
 						<div class="mt-1 text-2xl font-bold">{stats.total_files.toLocaleString()}</div>
 					</div>
 					<div class="rounded-lg border bg-card p-4">
-						<div class="text-sm font-medium text-muted-foreground">Storage Used</div>
+						<div class="text-sm font-medium text-muted-foreground">Your Storage Used</div>
 						<div class="mt-1 text-2xl font-bold">{formatBytes(stats.total_file_size)}</div>
 					</div>
 				</div>

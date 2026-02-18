@@ -6,6 +6,7 @@ mod user;
 
 use std::path::PathBuf;
 use std::sync::LazyLock;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
@@ -23,6 +24,7 @@ static KEYS: LazyLock<auth::Keys> = LazyLock::new(|| {
 pub struct AppState {
     pub db_pool: SqlitePool,
     pub storage_root: PathBuf,
+    pub stats_cache: Arc<Mutex<stats::StatsCache>>,
 }
 
 #[derive(OpenApi)]
@@ -111,6 +113,7 @@ async fn main() {
     let state = AppState {
         db_pool,
         storage_root: PathBuf::from(storage_root),
+        stats_cache: Arc::new(Mutex::new(stats::StatsCache::new())),
     };
 
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
