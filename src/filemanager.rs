@@ -1,10 +1,9 @@
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use axum_typed_multipart::{FieldData, TryFromMultipart, TypedMultipart};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{FromRow, SqlitePool};
@@ -23,7 +22,6 @@ pub struct File {
     pub original_name: String,
     pub mime_type: String,
     pub size_bytes: i64,
-    pub is_encrypted: bool,
     pub storage_path: String,
     pub created_at: String,
 }
@@ -34,13 +32,6 @@ pub struct FileMetadata {
     pub mime_type: String,
     pub size_bytes: i64,
     pub client_encryption_algo: String,
-}
-
-#[derive(Debug, TryFromMultipart)]
-pub struct FileUploadForm {
-    #[form_data(limit = "100MB")]
-    pub file: FieldData<axum::body::Bytes>,
-    pub metadata: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -122,15 +113,14 @@ impl FileRepository {
 
     pub async fn create_file(&self, file: &File) -> Result<(), FileError> {
         sqlx::query(
-            "INSERT INTO files (id, user_id, original_name, mime_type, size_bytes, is_encrypted, storage_path, created_at) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO files (id, user_id, original_name, mime_type, size_bytes, storage_path, created_at) 
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&file.id)
         .bind(&file.user_id)
         .bind(&file.original_name)
         .bind(&file.mime_type)
         .bind(file.size_bytes)
-        .bind(file.is_encrypted)
         .bind(&file.storage_path)
         .bind(&file.created_at)
         .execute(&self.pool)
@@ -243,39 +233,75 @@ impl FileRepository {
 pub async fn upload_file(
     claims: Claims,
     State(state): State<AppState>,
-    TypedMultipart(form): TypedMultipart<FileUploadForm>,
+    mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<FileResponse>), FileError> {
-    let metadata: FileMetadata =
-        serde_json::from_str(&form.metadata).map_err(|_| FileError::InvalidMetadata)?;
+    let mut metadata: Option<FileMetadata> = None;
+    let mut file_id: Option<String> = None;
+    let mut storage_path: Option<String> = None;
+    let mut actual_size: i64 = 0;
 
-    let file_id = Uuid::new_v4().to_string();
-    let storage_path = format!("{}/{}.bin", claims.user_id, file_id);
-    let full_path = state.storage_root.join(&storage_path);
+    const MAX_FILE_SIZE: usize = 100 * 1024 * 1024; // 100MB limit
 
-    let mut file_handle = tokio::fs::File::create(&full_path)
-        .await
-        .map_err(|_| FileError::StorageError)?;
+    while let Some(field) = multipart.next_field().await.map_err(|_| FileError::InvalidMetadata)? {
+        let field_name = field.name().unwrap_or("").to_string();
 
-    file_handle
-        .write_all(&form.file.contents)
-        .await
-        .map_err(|_| FileError::StorageError)?;
+        if field_name == "metadata" {
+            let data = field.bytes().await.map_err(|_| FileError::InvalidMetadata)?;
+            metadata = Some(serde_json::from_slice(&data).map_err(|_| FileError::InvalidMetadata)?);
+        } else if field_name == "file" {
+            // Generate file ID and path
+            let id = Uuid::new_v4().to_string();
+            let path = format!("{}/{}.bin", claims.user_id, id);
+            let full_path = state.storage_root.join(&path);
 
-    file_handle
-        .flush()
-        .await
-        .map_err(|_| FileError::StorageError)?;
+            // Create user directory if it doesn't exist
+            if let Some(parent) = full_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|_| FileError::StorageError)?;
+            }
 
-    // Calculate actual file size from uploaded data to prevent size spoofing
-    let actual_size = form.file.contents.len() as i64;
+            // Stream file to disk
+            let mut file_handle = tokio::fs::File::create(&full_path)
+                .await
+                .map_err(|_| FileError::StorageError)?;
+
+            let mut size = 0usize;
+            let mut stream = field;
+
+            while let Some(chunk) = stream.chunk().await.map_err(|_| FileError::StorageError)? {
+                size += chunk.len();
+                if size > MAX_FILE_SIZE {
+                    // Clean up partial file
+                    drop(file_handle);
+                    let _ = tokio::fs::remove_file(&full_path).await;
+                    return Err(FileError::InvalidMetadata); // File too large
+                }
+                file_handle.write_all(&chunk)
+                    .await
+                    .map_err(|_| FileError::StorageError)?;
+            }
+
+            file_handle.flush()
+                .await
+                .map_err(|_| FileError::StorageError)?;
+
+            actual_size = size as i64;
+            file_id = Some(id);
+            storage_path = Some(path);
+        }
+    }
+
+    let metadata = metadata.ok_or(FileError::InvalidMetadata)?;
+    let file_id = file_id.ok_or(FileError::InvalidMetadata)?;
+    let storage_path = storage_path.ok_or(FileError::InvalidMetadata)?;
 
     let file = File {
         id: file_id.clone(),
         user_id: claims.user_id.clone(),
         original_name: metadata.original_name,
         mime_type: metadata.mime_type,
-        size_bytes: actual_size, // Use actual size, not user-provided metadata
-        is_encrypted: true,
+        size_bytes: actual_size, // Use actual size from stream
         storage_path,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -373,6 +399,9 @@ pub async fn download_file(
     let stream = ReaderStream::new(file_handle);
     let body = axum::body::Body::from_stream(stream);
 
+    // Sanitize filename to prevent header injection
+    let safe_filename = sanitize_filename(&file.original_name);
+
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -380,12 +409,33 @@ pub async fn download_file(
     );
     headers.insert(
         header::CONTENT_DISPOSITION,
-        format!("attachment; filename=\"{}\"", file.original_name)
+        format!("attachment; filename=\"{}\"", safe_filename)
             .parse()
-            .unwrap(),
+            .unwrap_or_else(|_| "attachment; filename=\"download.bin\"".parse().unwrap()),
     );
 
     Ok((headers, body).into_response())
+}
+
+/// Sanitize filename by removing/replacing invalid header characters
+fn sanitize_filename(filename: &str) -> String {
+    filename
+        .chars()
+        .filter_map(|c| {
+            // Remove control characters, newlines, and other problematic chars
+            if c.is_control() || c == '\n' || c == '\r' || c == '\\' || c == '"' {
+                None
+            } else if !c.is_ascii() {
+                // Replace non-ASCII with underscore to be safe
+                Some('_')
+            } else {
+                Some(c)
+            }
+        })
+        .collect::<String>()
+        .chars()
+        .take(255) // Limit filename length
+        .collect()
 }
 
 #[utoipa::path(

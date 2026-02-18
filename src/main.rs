@@ -11,6 +11,10 @@ use std::sync::{Arc, Mutex};
 use axum::Router;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use tower_http::cors::{Any, CorsLayer};
+use tower_governor::{
+    governor::GovernorConfigBuilder, 
+    GovernorLayer,
+};
 use utoipa::OpenApi;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_swagger_ui::SwaggerUi;
@@ -133,10 +137,18 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // Rate limiting: 2 requests per second per IP, burst of 20
+    let governor_conf = GovernorConfigBuilder::default()
+        .per_second(2)  // 2 requests per second
+        .burst_size(20) // Allow bursts up to 20 requests
+        .finish()
+        .unwrap();
+
     let app = Router::new()
         .merge(router)
         .merge(SwaggerUi::new("/swagger-ui").url("/api/openapi.json", api))
         .layer(cors)
+        .layer(GovernorLayer::new(Arc::new(governor_conf)))
         .fallback(static_files::handler);
 
     let addr = format!("0.0.0.0:{}", port);
