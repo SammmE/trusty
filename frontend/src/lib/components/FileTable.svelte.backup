@@ -1,0 +1,472 @@
+<script lang="ts">
+	import { onMount } from 'svelte';
+	import { listFiles, downloadFile, deleteFile, type FileMetadata, type ApiError } from '$lib/api';
+	import { decryptFile, downloadDecryptedFile, CryptoError } from '$lib/crypto';
+	import {
+		Table,
+		TableBody,
+		TableCell,
+		TableHead,
+		TableHeader,
+		TableRow
+	} from '$lib/components/ui/table';
+	import { Input } from '$lib/components/ui/input';
+	import { Skeleton } from '$lib/components/ui/skeleton';
+	import {
+		DropdownMenu,
+		DropdownMenuContent,
+		DropdownMenuItem,
+		DropdownMenuTrigger
+	} from '$lib/components/ui/dropdown-menu';
+	import * as ContextMenu from '$lib/components/ui/context-menu';
+	import { Button } from '$lib/components/ui/button';
+	import {
+		Dialog,
+		DialogContent,
+		DialogDescription,
+		DialogFooter,
+		DialogHeader,
+		DialogTitle
+	} from '$lib/components/ui/dialog';
+	import { Label } from '$lib/components/ui/label';
+	import { File, Folder, ChevronRight, ChevronDown, MoreHorizontal, ArrowUpDown, Search } from 'lucide-svelte';
+
+	interface Props {
+		refresh?: number;
+	}
+
+	let { refresh = 0 }: Props = $props();
+
+	let files: FileMetadata[] = $state([]);
+	let loading = $state(true);
+	let searchQuery = $state('');
+	let sortColumn = $state('created_at');
+	let sortDirection: 'asc' | 'desc' = $state('desc');
+	let error = $state('');
+
+	let downloadingId = $state<string | null>(null);
+	let showPasswordDialog = $state(false);
+	let passwordDialogFile = $state<FileMetadata | null>(null);
+	let downloadPassword = $state('');
+	let passwordError = $state('');
+
+	let deletingId = $state<string | null>(null);
+	let contextMenuFile = $state<FileMetadata | null>(null);
+	
+	let expandedFolders = $state<Set<string>>(new Set());
+
+	interface FileNode {
+		name: string;
+		path: string;
+		isFolder: boolean;
+		file?: FileMetadata;
+		children?: FileNode[];
+		depth: number;
+	}
+
+	let fileTree = $derived.by(() => {
+		const tree: FileNode[] = [];
+		const folders = new Map<string, FileNode>();
+
+		files.forEach(file => {
+			const parts = file.original_name.split('/');
+			
+			if (parts.length === 1) {
+				// File in root
+				tree.push({
+					name: file.original_name,
+					path: file.original_name,
+					isFolder: false,
+					file,
+					depth: 0
+				});
+			} else {
+				// File in a folder
+				let currentPath = '';
+				for (let i = 0; i < parts.length - 1; i++) {
+					const folderName = parts[i];
+					const parentPath = currentPath;
+					currentPath = currentPath ? `${currentPath}/${folderName}` : folderName;
+
+					if (!folders.has(currentPath)) {
+						const folderNode: FileNode = {
+							name: folderName,
+							path: currentPath,
+							isFolder: true,
+							children: [],
+							depth: i
+						};
+						folders.set(currentPath, folderNode);
+
+						if (parentPath && folders.has(parentPath)) {
+							folders.get(parentPath)!.children!.push(folderNode);
+						} else if (!parentPath) {
+							tree.push(folderNode);
+						}
+					}
+				}
+
+				// Add the file to its parent folder
+				const parentFolder = folders.get(currentPath);
+				if (parentFolder) {
+					parentFolder.children!.push({
+						name: parts[parts.length - 1],
+						path: file.original_name,
+						isFolder: false,
+						file,
+						depth: parts.length - 1
+					});
+				}
+			}
+		});
+
+		// Sort tree
+		const sortTree = (nodes: FileNode[]) => {
+			nodes.sort((a, b) => {
+				// Folders first
+				if (a.isFolder && !b.isFolder) return -1;
+				if (!a.isFolder && b.isFolder) return 1;
+				return a.name.localeCompare(b.name);
+			});
+			nodes.forEach(node => {
+				if (node.children) {
+					sortTree(node.children);
+				}
+			});
+		};
+		sortTree(tree);
+
+		return tree;
+	});
+
+	let flattenedTree = $derived.by(() => {
+		const flattened: FileNode[] = [];
+		
+		const flatten = (nodes: FileNode[]) => {
+			nodes.forEach(node => {
+				flattened.push(node);
+				if (node.isFolder && node.children && expandedFolders.has(node.path)) {
+					flatten(node.children);
+				}
+			});
+		};
+		
+		flatten(fileTree);
+		return flattened;
+	});
+
+	function toggleFolder(path: string) {
+		if (expandedFolders.has(path)) {
+			expandedFolders.delete(path);
+		} else {
+			expandedFolders.add(path);
+		}
+		expandedFolders = new Set(expandedFolders);
+	}
+
+	async function loadData() {
+		loading = true;
+		error = '';
+		try {
+			const sortField = sortColumn === 'created_at' ? 'date' : sortColumn;
+			files = await listFiles(searchQuery || undefined, sortField, sortDirection);
+		} catch (err) {
+			const apiError = err as ApiError;
+			error = apiError.body?.error || apiError.message || 'Failed to load files';
+		} finally {
+			loading = false;
+		}
+	}
+
+	function toggleSort(col: string) {
+		if (sortColumn === col) {
+			sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+		} else {
+			sortColumn = col;
+			sortDirection = 'asc';
+		}
+		loadData();
+	}
+
+	let timer: any;
+	function handleSearch(e: Event) {
+		searchQuery = (e.target as HTMLInputElement).value;
+		clearTimeout(timer);
+		timer = setTimeout(() => {
+			loadData();
+		}, 300);
+	}
+
+	function formatFileSize(bytes: number): string {
+		if (bytes < 1024) return bytes + ' B';
+		if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+		if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+		return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+	}
+
+	function formatDate(dateString: string): string {
+		const date = new Date(dateString);
+		return date.toLocaleDateString();
+	}
+
+	function promptDownload(file: FileMetadata) {
+		passwordDialogFile = file;
+		downloadPassword = '';
+		passwordError = '';
+		showPasswordDialog = true;
+	}
+
+	async function handleDownload() {
+		if (!passwordDialogFile || !downloadPassword) {
+			passwordError = 'Please enter a password';
+			return;
+		}
+
+		const file = passwordDialogFile;
+		downloadingId = file.id;
+		passwordError = '';
+
+		try {
+			const encryptedBlob = await downloadFile(file.id);
+			const decryptedBlob = await decryptFile(encryptedBlob, downloadPassword, file.original_name);
+			downloadDecryptedFile(decryptedBlob, file.original_name);
+
+			showPasswordDialog = false;
+			passwordDialogFile = null;
+			downloadPassword = '';
+		} catch (err) {
+			if (err instanceof CryptoError) {
+				passwordError = 'Decryption failed - wrong password';
+			} else if (err instanceof Error) {
+				const apiError = err as ApiError;
+				passwordError = apiError.body?.error || apiError.message || 'Download failed';
+			}
+		} finally {
+			downloadingId = null;
+		}
+	}
+
+	async function handleDelete(file: FileMetadata) {
+		if (!confirm(`Are you sure you want to delete "${file.original_name}"?`)) {
+			return;
+		}
+
+		deletingId = file.id;
+		try {
+			await deleteFile(file.id);
+			await loadData();
+		} catch (err) {
+			const apiError = err as ApiError;
+			alert(apiError.body?.error || apiError.message || 'Delete failed');
+		} finally {
+			deletingId = null;
+		}
+	}
+
+	$effect(() => {
+		if (refresh !== undefined) {
+			loadData();
+		}
+	});
+
+	onMount(() => {
+		loadData();
+	});
+</script>
+
+<div class="space-y-4">
+	{#if error}
+		<div class="rounded-md bg-red-50 p-4">
+			<p class="text-sm text-red-800">{error}</p>
+		</div>
+	{/if}
+
+	<div class="flex items-center justify-between">
+		<div class="relative w-full max-w-sm">
+			<Search class="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
+			<Input placeholder="Search files..." class="pl-8" oninput={handleSearch} />
+		</div>
+		<div class="text-sm text-muted-foreground">{files.length} items</div>
+	</div>
+
+	<div class="rounded-md border shadow-sm">
+		<Table>
+			<TableHeader>
+				<TableRow>
+					<TableHead class="w-[50px]"></TableHead>
+
+					<TableHead>
+						<Button variant="ghost" onclick={() => toggleSort('original_name')}>
+							Name <ArrowUpDown class="ml-2 h-4 w-4" />
+						</Button>
+					</TableHead>
+
+					<TableHead>
+						<Button variant="ghost" onclick={() => toggleSort('size_bytes')}>
+							Size <ArrowUpDown class="ml-2 h-4 w-4" />
+						</Button>
+					</TableHead>
+
+					<TableHead>
+						<Button variant="ghost" onclick={() => toggleSort('created_at')}>
+							Date <ArrowUpDown class="ml-2 h-4 w-4" />
+						</Button>
+					</TableHead>
+
+					<TableHead class="text-right">Actions</TableHead>
+				</TableRow>
+			</TableHeader>
+
+			<TableBody>
+				{#if loading}
+					{#each Array(3) as _}
+						<TableRow>
+							<TableCell><Skeleton class="h-8 w-8 rounded" /></TableCell>
+							<TableCell><Skeleton class="h-4 w-[200px]" /></TableCell>
+							<TableCell><Skeleton class="h-4 w-[80px]" /></TableCell>
+							<TableCell><Skeleton class="h-4 w-[100px]" /></TableCell>
+							<TableCell><Skeleton class="ml-auto h-8 w-8 rounded-full" /></TableCell>
+						</TableRow>
+					{/each}
+				{:else if flattenedTree.length === 0}
+					<TableRow>
+						<TableCell colspan={5} class="h-24 text-center"> No files found. </TableCell>
+					</TableRow>
+				{:else}
+					{#each flattenedTree as node}
+						{#if node.isFolder}
+							<TableRow class="cursor-pointer hover:bg-muted/50" onclick={() => toggleFolder(node.path)}>
+								<TableCell>
+									<div class="flex h-8 w-8 items-center justify-center rounded bg-muted">
+										<Folder class="h-4 w-4 opacity-70" />
+									</div>
+								</TableCell>
+								<TableCell class="font-medium">
+									<div class="flex items-center" style="padding-left: {node.depth * 20}px">
+										{#if expandedFolders.has(node.path)}
+											<ChevronDown class="mr-1 h-4 w-4" />
+										{:else}
+											<ChevronRight class="mr-1 h-4 w-4" />
+										{/if}
+										{node.name}
+									</div>
+								</TableCell>
+								<TableCell class="text-muted-foreground">—</TableCell>
+								<TableCell class="text-muted-foreground">—</TableCell>
+								<TableCell class="text-right"></TableCell>
+							</TableRow>
+						{:else}
+							<ContextMenu.Root>
+								<ContextMenu.Trigger
+									class="contents"
+									oncontextmenu={() => (contextMenuFile = node.file || null)}
+								>
+									<TableRow class="cursor-default">
+										<TableCell>
+											<div class="flex h-8 w-8 items-center justify-center rounded bg-muted">
+												<File class="h-4 w-4 opacity-70" />
+											</div>
+										</TableCell>
+										<TableCell class="font-medium">
+											<div style="padding-left: {node.depth * 20}px">
+												{node.name}
+											</div>
+										</TableCell>
+										<TableCell>{node.file ? formatFileSize(node.file.size_bytes) : '—'}</TableCell>
+										<TableCell class="text-muted-foreground">
+											{node.file ? formatDate(node.file.created_at) : '—'}
+										</TableCell>
+										<TableCell class="text-right">
+											{#if node.file}
+												<DropdownMenu>
+													<DropdownMenuTrigger>
+														<Button variant="ghost" size="icon">
+															<MoreHorizontal class="h-4 w-4" />
+														</Button>
+													</DropdownMenuTrigger>
+													<DropdownMenuContent align="end">
+														<DropdownMenuItem
+															onclick={() => node.file && promptDownload(node.file)}
+															disabled={downloadingId === node.file.id}
+														>
+															{downloadingId === node.file.id ? 'Downloading...' : 'Download'}
+														</DropdownMenuItem>
+														<DropdownMenuItem
+															class="text-red-600"
+															onclick={() => node.file && handleDelete(node.file)}
+															disabled={deletingId === node.file.id}
+														>
+															{deletingId === node.file.id ? 'Deleting...' : 'Delete'}
+														</DropdownMenuItem>
+													</DropdownMenuContent>
+												</DropdownMenu>
+											{/if}
+										</TableCell>
+									</TableRow>
+								</ContextMenu.Trigger>
+
+								<ContextMenu.Content>
+									<ContextMenu.Item onclick={() => contextMenuFile && promptDownload(contextMenuFile)}>
+										Download File
+									</ContextMenu.Item>
+									<ContextMenu.Separator />
+									<ContextMenu.Item
+										variant="destructive"
+										onclick={() => contextMenuFile && handleDelete(contextMenuFile)}
+									>
+										Delete
+									</ContextMenu.Item>
+								</ContextMenu.Content>
+							</ContextMenu.Root>
+						{/if}
+					{/each}
+				{/if}
+			</TableBody>
+		</Table>
+	</div>
+</div>
+
+<Dialog bind:open={showPasswordDialog}>
+	<DialogContent class="sm:max-w-[425px]">
+		<DialogHeader>
+			<DialogTitle>Download File</DialogTitle>
+			<DialogDescription>
+				Enter the password to decrypt "{passwordDialogFile?.original_name}"
+			</DialogDescription>
+		</DialogHeader>
+
+		<div class="space-y-4 py-4">
+			<div>
+				<Label for="download-password">Decryption Password</Label>
+				<Input
+					id="download-password"
+					type="password"
+					bind:value={downloadPassword}
+					placeholder="Enter password"
+					disabled={downloadingId !== null}
+					class="mt-1"
+					onkeydown={(e) => e.key === 'Enter' && handleDownload()}
+				/>
+			</div>
+
+			{#if passwordError}
+				<div class="rounded-md bg-red-50 p-3">
+					<p class="text-sm text-red-800">{passwordError}</p>
+				</div>
+			{/if}
+		</div>
+
+		<DialogFooter>
+			<Button
+				variant="outline"
+				onclick={() => (showPasswordDialog = false)}
+				disabled={downloadingId !== null}
+			>
+				Cancel
+			</Button>
+			<Button onclick={handleDownload} disabled={downloadingId !== null || !downloadPassword}>
+				{downloadingId ? 'Downloading...' : 'Download'}
+			</Button>
+		</DialogFooter>
+	</DialogContent>
+</Dialog>
