@@ -50,12 +50,13 @@ export class ApiError extends Error {
 }
 
 function getAuthToken(): string | null {
-  return sessionStorage.getItem('auth_token') || localStorage.getItem('auth_token');
+  return sessionStorage.getItem('auth_token');
 }
 
 export function setAuthToken(token: string): void {
   sessionStorage.setItem('auth_token', token);
-  localStorage.setItem('auth_token', token);
+  // Clear any old tokens from localStorage
+  localStorage.removeItem('auth_token');
 }
 
 export function clearAuthToken(): void {

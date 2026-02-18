@@ -62,6 +62,18 @@
 	onMount(() => {
 		currentTheme = getTheme();
 		checkAuth();
+		
+		// Clear session data when window/tab closes
+		const handleBeforeUnload = () => {
+			// Session storage will auto-clear, but ensure everything is cleaned up
+			clearSession();
+		};
+		
+		window.addEventListener('beforeunload', handleBeforeUnload);
+		
+		return () => {
+			window.removeEventListener('beforeunload', handleBeforeUnload);
+		};
 	});
 </script>
 

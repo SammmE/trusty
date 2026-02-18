@@ -39,7 +39,7 @@
 
 	async function fetchStats() {
 		try {
-			const token = sessionStorage.getItem('auth_token') || localStorage.getItem('auth_token');
+			const token = sessionStorage.getItem('auth_token');
 			const response = await fetch('http://localhost:3000/api/stats', {
 				headers: token ? { Authorization: `Bearer ${token}` } : {},
 			});
